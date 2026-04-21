@@ -1,553 +1,402 @@
 const OpenAI = require("openai");
 const Foundation = require("../models/Foundation");
 
-// ============================================
-// OpenAI 初始化（容错：没有key也不崩）
-// ============================================
 let openai = null;
 try {
   if (process.env.OPENAI_API_KEY && !process.env.OPENAI_API_KEY.includes("your")) {
     openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     console.log("✅ OpenAI connected - AI mode enabled");
   } else {
-    console.log("⚡ No OpenAI key - will use keyword matching only");
+    console.log("⚡ No OpenAI key - keyword matching only");
   }
 } catch (e) {
-  console.log("⚡ OpenAI init failed - will use keyword matching only");
+  console.log("⚡ OpenAI init failed - keyword matching only");
 }
 
-// ============================================
-// 第一层：关键词精确匹配（Rule-based）
-// 成本：几乎为零（仅数据库查询+内存计算）
-// 适用：用户问题能被关键词直接解析
-// ============================================
+// ============================================================
+// Layer 0: 语言归一化
+// 把中文美妆词映射为英文，统一进入同一套评分引擎
+// PM 意义：确保中英文用户获得一致的推荐体验
+// ============================================================
+const CN_EN_MAP = {
+  '哑光': 'matte',    '无光': 'matte',    '控光': 'matte',
+  '水光': 'dewy',     '水润': 'dewy',     '亮泽': 'dewy',
+  '缎面': 'satin',    '自然光泽': 'natural',
+  '油皮': 'oily',     '出油': 'oily',
+  '干皮': 'dry',      '干性': 'dry',
+  '混合肌': 'combination', '混合皮': 'combination', '混油皮': 'combination',
+  '敏感肌': 'sensitive',   '敏感皮': 'sensitive',
+  '普通皮': 'normal',  '正常皮': 'normal',
+  '高遮': 'full coverage',  '全遮': 'full coverage',
+  '轻薄': 'light coverage', '无遮': 'light coverage',
+  '中等遮瑕': 'medium coverage',
+  '控油': 'oily oil control', '痘': 'acne',
+  '毛孔': 'pores',    '持久': 'long wear',
+  '纯素': 'vegan',    '零残忍': 'cruelty-free',
+  '防晒': 'spf',
+};
+
+const normalize = (message) => {
+  let msg = message.toLowerCase();
+  for (const [cn, en] of Object.entries(CN_EN_MAP)) {
+    msg = msg.replace(new RegExp(cn, 'g'), en);
+  }
+  // "200以内" → "under 200"
+  msg = msg.replace(/(\d+)\s*(?:以内|以下|块以内|元以内|rmb以内)/g, 'under $1');
+  return msg;
+};
+
+// ============================================================
+// Layer 1: 关键词精确匹配（高置信、零 LLM 成本）
+// ============================================================
 const keywordMatch = async (message) => {
-  const msg = message.toLowerCase();
+  const msg = normalize(message);
   let allProducts = await Foundation.find({}).lean();
 
-  // ========== 优化2：硬性条件检测 ==========
-  // 用户说 must/only/一定要/必须 + 属性 → 先做硬性过滤，再打分
-  const mustPatterns = /\b(must|only|have to|need to|一定|必须|只要|只看)\b/;
-  const hasMustModifier = mustPatterns.test(msg);
-
-  if (hasMustModifier) {
-    if (msg.includes("vegan") || msg.includes("纯素")) {
-      allProducts = allProducts.filter(p => p.isVegan);
-    }
-    if (msg.includes("cruelty-free") || msg.includes("cruelty free") || msg.includes("零残忍")) {
-      allProducts = allProducts.filter(p => p.isCrueltyFree);
-    }
-    if (msg.includes("spf") || msg.includes("防晒")) {
-      allProducts = allProducts.filter(p => p.spf > 0);
-    }
-    // 肤质硬性过滤
-    const skinTypes = { oily: "oily", dry: "dry", combination: "combination", sensitive: "sensitive" };
-    for (const [keyword, type] of Object.entries(skinTypes)) {
-      if (msg.includes(keyword)) {
-        allProducts = allProducts.filter(p => p.skinTypes.includes(type));
-      }
+  // 硬性条件过滤（用户明确表达 must/只要/必须）
+  const mustPattern = /\b(must|only|have to|need to|一定|必须|只要|只看)\b/;
+  if (mustPattern.test(msg)) {
+    if (msg.includes("vegan"))          allProducts = allProducts.filter(p => p.isVegan);
+    if (msg.includes("cruelty-free") || msg.includes("cruelty free"))
+                                        allProducts = allProducts.filter(p => p.isCrueltyFree);
+    if (msg.includes("spf"))            allProducts = allProducts.filter(p => p.spf > 0);
+    for (const [kw, type] of [["oily","oily"],["dry","dry"],["combination","combination"],["sensitive","sensitive"]]) {
+      if (msg.includes(kw)) allProducts = allProducts.filter(p => p.skinTypes.includes(type));
     }
   }
 
-  // 对每个产品计算匹配分数
-  const scored = allProducts.map((p) => {
+  const scored = allProducts.map(p => {
     let score = 0;
     const reasons = [];
 
-    // --- 肤质匹配（权重最高，+3）---
-    const skinTypes = { oily: "oily", dry: "dry", combination: "combination", sensitive: "sensitive", normal: "normal" };
-    for (const [keyword, type] of Object.entries(skinTypes)) {
-      if (msg.includes(keyword) && p.skinTypes.includes(type)) {
-        score += 3;
-        reasons.push(`suits ${type} skin`);
+    // 肤质 +3
+    for (const [kw, type] of [["oily","oily"],["dry","dry"],["combination","combination"],["sensitive","sensitive"],["normal","normal"]]) {
+      if (msg.includes(kw) && p.skinTypes.includes(type)) {
+        score += 3; reasons.push(`suits ${type} skin`);
       }
     }
-
-    // --- 妆效匹配（+3）---
-    const finishes = ["matte", "dewy", "satin", "natural"];
-    for (const finish of finishes) {
+    // 妆效 +3
+    for (const finish of ["matte","dewy","satin","natural","radiant"]) {
       if (msg.includes(finish) && p.finish.toLowerCase() === finish) {
-        score += 3;
-        reasons.push(`${finish} finish`);
+        score += 3; reasons.push(`${finish} finish`);
       }
     }
-
-    // --- 遮瑕力度匹配（+2）---
-    const coverages = ["light", "medium", "full"];
-    for (const cov of coverages) {
+    // 遮瑕 +2
+    for (const cov of ["light","medium","full"]) {
       if (msg.includes(cov) && p.coverage.toLowerCase().includes(cov)) {
-        score += 2;
-        reasons.push(`${cov} coverage`);
+        score += 2; reasons.push(`${cov} coverage`);
       }
     }
-
-    // --- 价格匹配（+2）---
+    // 预算 +2
     const budgetMatch = msg.match(/under\s*\$?(\d+)/);
     if (budgetMatch && p.price <= parseInt(budgetMatch[1])) {
-      score += 2;
-      reasons.push(`within budget at $${p.price}`);
+      score += 2; reasons.push(`within budget at $${p.price}`);
     }
-    const budgetMatchCN = msg.match(/(\d+)\s*(?:以内|以下|块以内|元以内)/);
-    if (budgetMatchCN && p.price <= parseInt(budgetMatchCN[1])) {
-      score += 2;
-      reasons.push(`within budget at $${p.price}`);
-    }
-
-    // --- 品牌匹配（+4，最高权重）---
+    // 品牌 +4（最强信号）
     if (msg.includes(p.brand.toLowerCase())) {
-      score += 4;
-      reasons.push(`matches brand ${p.brand}`);
+      score += 4; reasons.push(`${p.brand} brand match`);
     }
-
-    // --- 关注点匹配（+2）---
-    const concernMap = {
-      "acne": "acne", "pore": "pores", "aging": "aging", "wrinkle": "aging",
-      "dark spot": "dark spots", "dull": "dullness", "redness": "redness",
-      "oil control": "oiliness", "控油": "oiliness", "痘": "acne", "毛孔": "pores"
-    };
-    for (const [keyword, concern] of Object.entries(concernMap)) {
-      if (msg.includes(keyword) && p.concerns.some(c => c.toLowerCase().includes(concern))) {
-        score += 2;
-        reasons.push(`addresses ${concern}`);
+    // 关注点 +2
+    const concerns = { "acne":"acne","pore":"pores","aging":"aging","wrinkle":"aging","dark spot":"dark spots","dull":"dullness","redness":"redness","oil control":"oiliness","long wear":"longevity" };
+    for (const [kw, concern] of Object.entries(concerns)) {
+      if (msg.includes(kw) && p.concerns.some(c => c.toLowerCase().includes(concern.split(' ')[0]))) {
+        score += 2; reasons.push(`addresses ${concern}`);
       }
     }
-
-    // --- 特殊属性匹配（+1）---
-    if ((msg.includes("vegan") || msg.includes("纯素")) && p.isVegan) {
-      score += 1;
-      reasons.push("vegan formula");
-    }
-    if ((msg.includes("cruelty-free") || msg.includes("cruelty free") || msg.includes("零残忍")) && p.isCrueltyFree) {
-      score += 1;
-      reasons.push("cruelty-free");
-    }
-    if (msg.includes("spf") && p.spf > 0) {
-      score += 1;
-      reasons.push(`has SPF ${p.spf}`);
-    }
+    // 特殊属性 +1
+    if (msg.includes("vegan")        && p.isVegan)      { score += 1; reasons.push("vegan"); }
+    if ((msg.includes("cruelty-free") || msg.includes("cruelty free")) && p.isCrueltyFree) { score += 1; reasons.push("cruelty-free"); }
+    if (msg.includes("spf")          && p.spf > 0)      { score += 1; reasons.push(`SPF ${p.spf}`); }
 
     return { product: p, score, reason: reasons.join(", ") };
   });
 
-  // 按分数排序，取top 3
-  const top = scored
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3);
-
-  return top;
+  return scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);
 };
 
-// ============================================
-// 优化1：基于"维度覆盖"的路由判断
-// 不再只看命中了几个关键词，而是看覆盖了几个核心决策维度
-// 核心维度：肤质、妆效、价格（至少覆盖2个不同维度才走第一层）
-// ============================================
+// 判断消息是否覆盖了足够的决策维度（归一化后判断）
 const isKeywordMatchable = (message) => {
-  const msg = message.toLowerCase();
-
-  // 检测每个维度是否被覆盖
-  const dimensions = {
-    skinType: false,
-    finish: false,
-    budget: false,
-    coverage: false,
-    brand: false,
-    concern: false,
+  const msg = normalize(message);
+  const dims = {
+    skinType: ["oily","dry","combination","sensitive","normal"].some(kw => msg.includes(kw)),
+    finish:   ["matte","dewy","satin","natural","radiant"].some(kw => msg.includes(kw)),
+    budget:   /under\s*\$?\d+/.test(msg),
+    coverage: ["light coverage","medium coverage","full coverage","sheer"].some(kw => msg.includes(kw)),
+    brand:    ["mac","fenty","nars","maybelline","loreal","l'oreal","clinique","bobbi brown",
+               "too faced","tarte","lancome","dior","chanel","revlon","covergirl","nyx","ilia",
+               "bareminerals","bare minerals","it cosmetics","charlotte tilbury","urban decay",
+               "smashbox","benefit","hourglass","laura mercier","milk makeup","merit","kosas",
+               "armani","ysl","givenchy","pat mcgrath","estee lauder"].some(kw => msg.includes(kw)),
   };
-
-  // 肤质维度
-  const skinKeywords = ["oily", "dry", "combination", "sensitive", "normal", "油皮", "干皮", "混合", "敏感"];
-  if (skinKeywords.some(kw => msg.includes(kw))) {
-    dimensions.skinType = true;
-  }
-
-  // 妆效维度
-  const finishKeywords = ["matte", "dewy", "satin", "natural", "哑光", "水光", "缎面"];
-  if (finishKeywords.some(kw => msg.includes(kw))) {
-    dimensions.finish = true;
-  }
-
-  // 价格维度
-  if (/under\s*\$?\d+|\d+\s*(?:以内|以下|块以内|元以内)/.test(msg)) {
-    dimensions.budget = true;
-  }
-
-  // 遮瑕维度
-  const coverageKeywords = ["light coverage", "medium coverage", "full coverage", "轻薄", "高遮瑕", "full cover", "sheer"];
-  if (coverageKeywords.some(kw => msg.includes(kw))) {
-    dimensions.coverage = true;
-  }
-
-  // 品牌维度（品牌本身就是最强信号，单独算一个维度）
-  // 这里简单检测一些常见品牌名，实际可以从数据库拉品牌列表
-  const brandKeywords = [
-    "mac", "fenty", "estee lauder", "estée lauder", "nars", "maybelline",
-    "loreal", "l'oreal", "clinique", "bobbi brown", "too faced", "tarte",
-    "lancome", "lancôme", "dior", "chanel", "revlon", "covergirl",
-    "nyx", "ilia", "bare minerals", "bareminerals", "it cosmetics",
-    "charlotte tilbury", "urban decay", "smashbox", "benefit",
-    "hourglass", "laura mercier", "milk makeup", "merit", "kosas",
-    "rose inc", "armani", "ysl", "givenchy", "pat mcgrath"
-  ];
-  if (brandKeywords.some(kw => msg.includes(kw))) {
-    dimensions.brand = true;
-  }
-
-  // 关注点维度
-  const concernKeywords = [
-    "acne", "pore", "aging", "wrinkle", "dark spot", "dull", "redness",
-    "oil control", "控油", "痘", "毛孔", "long wear", "持久"
-  ];
-  if (concernKeywords.some(kw => msg.includes(kw))) {
-    dimensions.concern = true;
-  }
-
-  // 计算覆盖了几个不同维度
-  const coveredDimensions = Object.values(dimensions).filter(v => v).length;
-
-  // 品牌维度特殊处理：品牌+任意1个其他维度就够了（品牌是最强意图信号）
-  if (dimensions.brand && coveredDimensions >= 2) return true;
-
-  // 其他情况：至少覆盖2个核心维度（肤质、妆效、价格、遮瑕中的2个）
-  const coreDimensions = [dimensions.skinType, dimensions.finish, dimensions.budget, dimensions.coverage];
-  const coveredCoreDimensions = coreDimensions.filter(v => v).length;
-
-  return coveredCoreDimensions >= 2;
+  if (dims.brand && Object.values(dims).filter(Boolean).length >= 2) return true;
+  return [dims.skinType, dims.finish, dims.budget, dims.coverage].filter(Boolean).length >= 2;
 };
 
-// ============================================
-// 优化3：识别用户缺少哪些维度，生成追问消息
-// ============================================
-const getMissingDimensions = (message) => {
-  const msg = message.toLowerCase();
-  const missing = [];
-
-  const skinKeywords = ["oily", "dry", "combination", "sensitive", "normal", "油皮", "干皮", "混合", "敏感"];
-  const finishKeywords = ["matte", "dewy", "satin", "natural", "哑光", "水光"];
-  const hasBudget = /under\s*\$?\d+|\d+\s*(?:以内|以下|块以内|元以内)/.test(msg);
-
-  if (!skinKeywords.some(kw => msg.includes(kw))) {
-    missing.push("skin type (oily, dry, combination, sensitive, or normal)");
-  }
-  if (!finishKeywords.some(kw => msg.includes(kw))) {
-    missing.push("preferred finish (matte, dewy, satin, or natural)");
-  }
-  if (!hasBudget) {
-    missing.push("budget range");
-  }
-
-  return missing;
+// ============================================================
+// Layer 2a: LLM 意图提取（仅解析 5 个字段，不再传入产品库）
+//
+// 原架构：把 60 个产品全塞进 prompt，让 GPT 直接给产品 ID
+//   问题：① prompt 超长（成本高）② 推荐逻辑是黑盒
+//
+// 新架构：LLM 只做"自然语言 → 结构化意图"的翻译工作
+//   ① prompt 极小（无产品信息），token 成本降低 ~80%
+//   ② 推荐决策由自有引擎完成，逻辑完全可解释
+// ============================================================
+const VALID_ENUMS = {
+  skinType: ['oily','dry','combination','sensitive','normal'],
+  finish:   ['matte','dewy','satin','natural','radiant'],
+  coverage: ['light','medium','medium-to-full','full'],
 };
 
-const buildFollowUpMessage = (matchCount, message) => {
-  const missing = getMissingDimensions(message);
+const extractIntent = async (message, conversationHistory = []) => {
+  // 拼接最近 6 轮对话作为上下文，让 LLM 能合并多轮偏好
+  const context = conversationHistory
+    .slice(-6)
+    .map(m => `${m.role === 'user' ? 'User' : 'Shine'}: ${m.content.substring(0, 150)}`)
+    .join('\n');
 
-  if (missing.length === 0) {
-    return null; // 信息已经足够，不需要追问
-  }
+  const prompt = `You are a beauty assistant. Extract foundation preferences from the user's message${context ? ' and conversation history' : ''}.
+${context ? `\nConversation:\n${context}\n` : ''}
+User: "${message}"
 
-  let followUp = `I found ${matchCount} options that could work, but I'd love to narrow it down for you! ✨\n\n`;
-  followUp += `Could you tell me a bit more about:\n`;
-  for (const item of missing) {
-    followUp += `• Your ${item}\n`;
-  }
-  followUp += `\nThat way I can give you a much more personalized recommendation!`;
-
-  return followUp;
-};
-
-// ============================================
-// 第二层：LLM 语义理解（GPT-4o-mini）
-// 成本：API调用费（token计费）
-// 适用：模糊/复杂的用户问题
-// ============================================
-const buildProductContext = async () => {
-  const products = await Foundation.find({}).lean();
-  return products
-    .map(
-      (p) =>
-        `[ID:${p._id}] ${p.brand} - ${p.name} | $${p.price} | Finish: ${p.finish} | Coverage: ${p.coverage} | Skin Types: ${p.skinTypes.join(", ")} | SPF: ${p.spf} | Undertones: ${p.undertones.join(", ")} | Key Ingredients: ${p.keyIngredients.join(", ")} | Concerns: ${p.concerns.join(", ")} | Vegan: ${p.isVegan} | Cruelty-Free: ${p.isCrueltyFree} | Rating: ${p.rating}/5 | Shades: ${p.shadeRange}`
-    )
-    .join("\n");
-};
-
-const SYSTEM_PROMPT = `You are Shine ✨, a friendly and knowledgeable beauty consultant specializing in foundation recommendations. 
-
-Your personality:
-- Warm, encouraging, and non-judgmental
-- You celebrate all skin types and tones
-- You explain WHY each product matches, not just WHAT to buy
-- You ask clarifying questions when the user's needs are unclear
-
-Your rules:
-1. ONLY recommend products from the provided database - NEVER make up products
-2. When recommending, always return structured data in this JSON format within your response:
-   |||RECOMMENDATIONS|||
-   [{"id": "mongodb_id", "reason": "why this matches"}]
-   |||END|||
-3. Recommend 2-4 products max per response
-4. If the user's query is vague, ask about: skin type, coverage preference, finish preference, budget, and any skin concerns
-5. Consider ALL factors: skin type compatibility, finish, coverage, price, ingredients, concerns
-6. Be conversational - don't just list products, explain your reasoning
-7. If asked about something outside foundation/beauty, gently redirect to foundation recommendations
-
-FOUNDATION DATABASE:
-{PRODUCT_CONTEXT}`;
-
-const llmChat = async (message, conversationHistory) => {
-  const productContext = await buildProductContext();
-  const systemPrompt = SYSTEM_PROMPT.replace("{PRODUCT_CONTEXT}", productContext);
-
-  const messages = [
-    { role: "system", content: systemPrompt },
-    ...conversationHistory.slice(-10),
-    { role: "user", content: message },
-  ];
+Return ONLY valid JSON with these fields (null if not mentioned):
+{
+  "skinType": "oily|dry|combination|sensitive|normal|null",
+  "finish": "matte|dewy|satin|natural|radiant|null",
+  "coverage": "light|medium|medium-to-full|full|null",
+  "budgetMax": number_or_null,
+  "brands": [],
+  "concerns": [],
+  "vegan": true/false/null,
+  "crueltyFree": true/false/null,
+  "spf": true/false/null,
+  "isComplete": true_if_at_least_2_preferences_mentioned_else_false
+}`;
 
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    messages,
-    temperature: 0.7,
-    max_tokens: 1000,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0,
+    max_tokens: 250,
+    response_format: { type: "json_object" },
   });
 
-  return completion.choices[0].message.content;
+  const raw = JSON.parse(completion.choices[0].message.content);
+
+  // 校验枚举值，防止 LLM 输出非法值进入数据库查询
+  for (const [field, allowed] of Object.entries(VALID_ENUMS)) {
+    if (raw[field] && !allowed.includes(raw[field])) raw[field] = null;
+  }
+
+  // 自主计算 isComplete，不依赖 LLM 判断（LLM 判断过于保守）
+  // 规则：≥2 个具体字段，或者有明确的 boolean 属性（vegan/cruelty-free/spf）
+  const meaningfulFields = [raw.skinType, raw.finish, raw.coverage, raw.budgetMax,
+                             ...(raw.brands || []), ...(raw.concerns || [])].filter(Boolean).length;
+  const hasBoolAttr = raw.vegan === true || raw.crueltyFree === true || raw.spf === true;
+  raw.isComplete = meaningfulFields >= 2 || hasBoolAttr;
+
+  return raw;
 };
 
-// ============================================
-// 第三层：多层解析 + 兜底
-// LLM输出是概率性的，格式不一定每次都对
-// 五层防线保证100%返回有意义的结果
-// ============================================
-const parseRecommendations = async (aiResponse) => {
-  // --- 防线1: 正则匹配提取分隔符之间的内容 ---
-  const recMatch = aiResponse.match(
-    /\|\|\|RECOMMENDATIONS\|\|\|([\s\S]*?)\|\|\|END\|\|\|/
-  );
+// ============================================================
+// Layer 2b: 意图驱动的自有匹配引擎
+// 分两阶段：① 硬过滤（MongoDB 查询）② 软评分（Python 式打分排序）
+// ============================================================
+const intentMatch = async (intent) => {
+  const filter = {};
 
-  if (recMatch) {
-    // --- 防线2: JSON.parse 严格解析 ---
-    try {
-      const recIds = JSON.parse(recMatch[1].trim());
+  // 第一阶段：硬过滤（不满足直接排除）
+  if (intent.skinType)      filter.skinTypes = intent.skinType;
+  if (intent.finish)        filter.finish = intent.finish;
+  if (intent.coverage)      filter.coverage = { $regex: intent.coverage.split('-')[0], $options: 'i' };
+  if (intent.budgetMax)     filter.price = { $lte: Number(intent.budgetMax) };
+  if (intent.vegan === true)       filter.isVegan = true;
+  if (intent.crueltyFree === true) filter.isCrueltyFree = true;
+  if (intent.spf === true)         filter.spf = { $gt: 0 };
+  if (intent.brands?.length > 0)  filter.brand = { $in: intent.brands.map(b => new RegExp(b, 'i')) };
 
-      // --- 防线3: 产品ID在MongoDB中验证（防幻觉：Ground-Truth Validation）---
-      const productIds = recIds.map((r) => r.id);
-      const products = await Foundation.find({ _id: { $in: productIds } }).lean();
+  let products = await Foundation.find(filter).lean();
 
-      const recommendations = recIds
-        .map((rec) => ({
-          product: products.find((p) => p._id.toString() === rec.id),
-          reason: rec.reason,
-        }))
-        .filter((r) => r.product); // 过滤掉不存在的（幻觉产品）
+  // 硬过滤结果太少时，放宽肤质限制（保留其他约束）
+  if (products.length < 2 && intent.skinType) {
+    const relaxed = { ...filter };
+    delete relaxed.skinTypes;
+    const extra = await Foundation.find(relaxed).lean();
+    const seen = new Set(products.map(p => p._id.toString()));
+    products = [...products, ...extra.filter(p => !seen.has(p._id.toString()))];
+  }
 
-      if (recommendations.length > 0) {
-        return recommendations;
-      }
-    } catch (parseError) {
-      console.warn("⚠️ JSON parse failed, trying loose extraction:", parseError.message);
+  if (products.length === 0) return [];
+
+  // 第二阶段：软评分（在硬过滤产品中，用评分和关注点进行排序）
+  const scored = products.map(p => {
+    let soft = p.rating || 4;   // 基础分来自产品评分
+    const reasons = [];
+
+    if (intent.skinType && p.skinTypes.includes(intent.skinType)) { soft += 1; reasons.push(`suits ${intent.skinType} skin`); }
+    if (intent.finish && p.finish.toLowerCase() === intent.finish) { soft += 1; reasons.push(`${intent.finish} finish`); }
+    if (intent.budgetMax && p.price <= intent.budgetMax)           { reasons.push(`$${p.price} within budget`); }
+    if (intent.concerns?.length > 0) {
+      const matched = intent.concerns.filter(c => p.concerns.some(pc => pc.toLowerCase().includes(c.toLowerCase())));
+      soft += matched.length * 0.5;
+      if (matched.length) reasons.push(`helps with ${matched.join(', ')}`);
     }
-  }
-
-  // --- 防线4: 宽松正则提取（JSON格式坏了但可能还有ID信息）---
-  try {
-    const idPattern = /[0-9a-f]{24}/gi;
-    const possibleIds = aiResponse.match(idPattern);
-
-    if (possibleIds && possibleIds.length > 0) {
-      const uniqueIds = [...new Set(possibleIds)];
-      const products = await Foundation.find({ _id: { $in: uniqueIds } }).lean();
-
-      if (products.length > 0) {
-        return products.slice(0, 4).map((p) => ({
-          product: p,
-          reason: "Recommended based on your preferences",
-        }));
-      }
+    if (intent.brands?.length > 0 && intent.brands.some(b => p.brand.toLowerCase().includes(b.toLowerCase()))) {
+      soft += 2; reasons.push(`from ${p.brand}`);
     }
-  } catch (looseError) {
-    console.warn("⚠️ Loose extraction also failed:", looseError.message);
-  }
+    if (intent.vegan      && p.isVegan)      reasons.push("vegan");
+    if (intent.crueltyFree && p.isCrueltyFree) reasons.push("cruelty-free");
 
-  return [];
-};
-
-// 兜底推荐：当LLM完全失败时，用评分最高的热门产品
-const fallbackRecommendation = async (message) => {
-  const msg = message.toLowerCase();
-  const allProducts = await Foundation.find({}).lean();
-
-  const keywordResults = await keywordMatch(message);
-  if (keywordResults.length > 0) {
-    return keywordResults;
-  }
-
-  const topRated = allProducts
-    .sort((a, b) => b.rating - a.rating)
-    .slice(0, 3)
-    .map((p) => ({
+    return {
       product: p,
-      reason: `Top-rated foundation (${p.rating}/5) - great starting point!`,
-    }));
+      score: soft,
+      reason: reasons.join('; ') || `${p.rating}/5 rated, matches your preferences`,
+    };
+  });
 
-  return topRated;
+  return scored.sort((a, b) => b.score - a.score).slice(0, 3);
 };
 
-// ============================================
-// 主入口：三级回退调度（含三项优化）
-// ============================================
+// ============================================================
+// 追问生成：基于已提取的意图，精准告知用户缺了什么
+// 优于原方案：原方案只看原始文本；新方案基于结构化意图，更准确
+// ============================================================
+const buildFollowUpFromIntent = (intent) => {
+  const captured = [];
+  if (intent.skinType)  captured.push(`${intent.skinType} skin`);
+  if (intent.finish)    captured.push(`${intent.finish} finish`);
+  if (intent.budgetMax) captured.push(`budget under $${intent.budgetMax}`);
+
+  const missing = [];
+  if (!intent.skinType)  missing.push('skin type (oily, dry, combination, or sensitive)');
+  if (!intent.finish)    missing.push('preferred finish (matte, dewy, or satin)');
+  if (!intent.budgetMax) missing.push('budget range');
+
+  if (missing.length === 0) return null;
+
+  let msg = captured.length > 0 ? `Got it — noted ${captured.join(' and ')} ✨\n\n` : '';
+  msg += `To find your perfect match, could you also share your ${missing[0]}`;
+  if (missing[1]) msg += ` and ${missing[1]}`;
+  msg += `?`;
+  return msg;
+};
+
+// ============================================================
+// 推荐消息模板（基于提取的意图生成，无需额外 LLM 调用）
+// ============================================================
+const buildResponseMessage = (intent, count) => {
+  const attrs = [];
+  if (intent.skinType)    attrs.push(`${intent.skinType} skin`);
+  if (intent.finish)      attrs.push(`${intent.finish} finish`);
+  if (intent.budgetMax)   attrs.push(`budget ≤$${intent.budgetMax}`);
+  if (intent.coverage)    attrs.push(`${intent.coverage} coverage`);
+  if (intent.vegan)       attrs.push('vegan');
+  if (intent.crueltyFree) attrs.push('cruelty-free');
+  const profile = attrs.length > 0 ? `for ${attrs.join(', ')} ` : '';
+  return `Here are my top ${count} picks ${profile}✨\n\nThese are matched to your specific needs — let me know if you'd like to explore other options!`;
+};
+
+// ============================================================
+// Layer 3: 兜底（评分最高的热门产品）
+// ============================================================
+const fallbackRecommendation = async () => {
+  const products = await Foundation.find({}).sort({ rating: -1 }).limit(3).lean();
+  return products.map(p => ({
+    product: p,
+    reason: `Top-rated (${p.rating}/5) — a great starting point! Share your skin type or finish preference for a personalized pick.`,
+  }));
+};
+
+// ============================================================
+// 主入口：三层架构
+//
+// Layer 1 — 关键词引擎（归一化 + 置信度判断）: <100ms，零 LLM 成本
+// Layer 2 — LLM意图提取 + 自有匹配引擎: 1-3s，~80% 成本↓ vs 原方案
+// Layer 3 — 热门兜底: 永不崩溃
+// ============================================================
 exports.chat = async (req, res) => {
   try {
     const { message, conversationHistory = [] } = req.body;
+    if (!message) return res.status(400).json({ success: false, error: "Message is required" });
 
-    if (!message) {
-      return res.status(400).json({ success: false, error: "Message is required" });
-    }
-
-    // ========== 第一层：尝试关键词精确匹配 ==========
-    // 优化1：基于维度覆盖判断，而不是简单的关键词数量
+    // ── Layer 1: 关键词匹配 ─────────────────────────────────────
     if (isKeywordMatchable(message)) {
-      const keywordResults = await keywordMatch(message);
+      const results = await keywordMatch(message);
+      if (results.length > 0) {
+        const topScore  = results[0].score;
+        const scoreGap  = topScore - (results[1]?.score ?? 0);
 
-      if (keywordResults.length > 0) {
-
-        // ========== 优化2b：信心度判断 ==========
-        // 如果前几名得分太接近，说明区分度不够，降级到LLM
-        const topScore = keywordResults[0].score;
-        const secondScore = keywordResults.length > 1 ? keywordResults[1].score : 0;
-        const scoreGap = topScore - secondScore;
-
-        // 如果第一名得分不够高（<4分），或者匹配结果太多且区分度低
-        // 说明信息不够精确，转给LLM或追问
-        if (topScore < 4 && scoreGap < 2) {
-          console.log(`⚠️ Layer 1 LOW CONFIDENCE: top=${topScore}, gap=${scoreGap}, falling through to LLM`);
-          // 不直接返回，fall through 到第二层
-        } else {
-
-          // ========== 优化3：结果太多时追问而不是硬推荐 ==========
-          // 统计总共有多少产品得分>0（匹配候选池的大小）
-          const allScored = await keywordMatch(message);
-          const totalMatches = allScored.length;
-
-          // 但这里 allScored 已经是 top 3 了，我们需要看过滤前的总数
-          // 重新算一下完整匹配数
-          const msg = message.toLowerCase();
-          const allProducts = await Foundation.find({}).lean();
-          const fullMatchCount = allProducts.filter(p => {
-            let s = 0;
-            const skinTypes = { oily: "oily", dry: "dry", combination: "combination", sensitive: "sensitive", normal: "normal" };
-            for (const [kw, type] of Object.entries(skinTypes)) {
-              if (msg.includes(kw) && p.skinTypes.includes(type)) s += 3;
-            }
-            const finishes = ["matte", "dewy", "satin", "natural"];
-            for (const f of finishes) {
-              if (msg.includes(f) && p.finish.toLowerCase() === f) s += 3;
-            }
-            if (msg.includes(p.brand.toLowerCase())) s += 4;
-            const budgetMatch = msg.match(/under\s*\$?(\d+)/);
-            if (budgetMatch && p.price <= parseInt(budgetMatch[1])) s += 2;
-            return s > 0;
-          }).length;
-
-          // 如果匹配到超过10个产品，说明条件不够收敛，追问用户
-          if (fullMatchCount > 10) {
-            const followUp = buildFollowUpMessage(fullMatchCount, message);
-            if (followUp) {
-              console.log(`💬 Layer 1 FOLLOW-UP: ${fullMatchCount} matches, asking user to narrow down`);
-              return res.json({
-                success: true,
-                data: {
-                  message: followUp,
-                  recommendations: [],
-                  _meta: { layer: 1, method: "keyword_followup", matchCount: fullMatchCount },
-                },
-              });
-            }
-          }
-
-          // 信心度够高、结果数量合理，直接返回
-          console.log(`✅ Layer 1 HIT: keyword match returned ${keywordResults.length} results (confidence: top=${topScore}, gap=${scoreGap})`);
-
-          const responseMsg =
-            "Great question! Based on what you're looking for, here are my top picks ✨\n\n" +
-            "I've matched these to your specific needs — take a look and let me know if you'd like to explore different options!";
-
+        // 置信度判断：取代原来粗糙的 fullMatchCount > 10
+        // topScore ≥ 4 说明至少匹配了 1 个核心维度 + 1 个其他维度
+        // scoreGap ≥ 2 说明第一名显著优于第二名，区分度足够
+        if (topScore >= 4 && scoreGap >= 2) {
+          console.log(`✅ Layer 1 HIT (score=${topScore}, gap=${scoreGap})`);
           return res.json({
             success: true,
             data: {
-              message: responseMsg,
-              recommendations: keywordResults.map((r) => ({ product: r.product, reason: r.reason })),
-              _meta: { layer: 1, method: "keyword_match", confidence: { topScore, scoreGap } },
+              message: "Great question! Based on what you're looking for, here are my top picks ✨\n\nI've matched these to your specific needs — let me know if you'd like other options!",
+              recommendations: results.map(r => ({ product: r.product, reason: r.reason })),
+              _meta: { layer: 1, method: 'keyword_match', confidence: { topScore, scoreGap } },
             },
           });
         }
+        console.log(`⚠️ Layer 1 low confidence (score=${topScore}, gap=${scoreGap}) → Layer 2`);
       }
-      console.log("⚠️ Layer 1 MISS: keyword match returned 0 results, falling through to LLM");
-    } else {
-      console.log("⏭️ Layer 1 SKIP: insufficient dimension coverage, going to LLM");
     }
 
-    // ========== 第二层：LLM 语义理解 ==========
+    // ── Layer 2: LLM 意图提取 + 自有引擎 ───────────────────────
     if (openai) {
       try {
-        console.log("🤖 Layer 2: calling GPT-4o-mini...");
-        const aiResponse = await llmChat(message, conversationHistory);
+        console.log("🤖 Layer 2: extracting intent...");
+        const intent = await extractIntent(message, conversationHistory);
+        console.log("📋 Intent:", JSON.stringify(intent));
 
-        const recommendations = await parseRecommendations(aiResponse);
+        // 意图不完整 → 精准追问
+        if (!intent.isComplete) {
+          const followUp = buildFollowUpFromIntent(intent);
+          if (followUp) {
+            return res.json({
+              success: true,
+              data: {
+                message: followUp,
+                recommendations: [],
+                _meta: { layer: 2, method: 'intent_followup', intent },
+              },
+            });
+          }
+        }
 
-        const cleanResponse = aiResponse
-          .replace(/\|\|\|RECOMMENDATIONS\|\|\|[\s\S]*?\|\|\|END\|\|\|/, "")
-          .trim();
-
-        if (recommendations.length > 0) {
-          console.log(`✅ Layer 2+3 HIT: LLM + parse returned ${recommendations.length} results`);
+        // 意图完整 → 自有引擎匹配
+        const results = await intentMatch(intent);
+        if (results.length > 0) {
+          console.log(`✅ Layer 2 HIT: ${results.length} results from intent engine`);
           return res.json({
             success: true,
             data: {
-              message: cleanResponse,
-              recommendations,
-              _meta: { layer: 2, method: "llm_semantic" },
+              message: buildResponseMessage(intent, results.length),
+              recommendations: results.map(r => ({ product: r.product, reason: r.reason })),
+              _meta: { layer: 2, method: 'intent_engine', intent },
             },
           });
         }
-
-        if (cleanResponse.length > 0) {
-          console.log("✅ Layer 2: LLM responded (no recommendations - likely a clarifying question)");
-          return res.json({
-            success: true,
-            data: {
-              message: cleanResponse,
-              recommendations: [],
-              _meta: { layer: 2, method: "llm_clarification" },
-            },
-          });
-        }
-
-        console.log("⚠️ Layer 2+3 MISS: LLM response could not be parsed, falling to fallback");
-      } catch (llmError) {
-        console.error("❌ Layer 2 ERROR:", llmError.message);
+        console.log("⚠️ Layer 2 intent engine: 0 results → fallback");
+      } catch (err) {
+        console.error("❌ Layer 2 ERROR:", err.message);
       }
-    } else {
-      console.log("⏭️ Layer 2 SKIP: no OpenAI key available");
     }
 
-    // ========== 兜底层：关键词匹配 + 热门推荐 ==========
-    console.log("🛡️ Fallback: using keyword match + top-rated products");
-    const fallbackResults = await fallbackRecommendation(message);
-
-    const fallbackMsg =
-      "Here are some popular options that might work for you ✨\n\n" +
-      "If you can tell me more about your skin type, preferred finish, or budget, I can narrow it down further!";
-
+    // ── Layer 3: 兜底 ───────────────────────────────────────────
+    console.log("🛡️ Layer 3: fallback");
+    const fallback = await fallbackRecommendation();
     return res.json({
       success: true,
       data: {
-        message: fallbackMsg,
-        recommendations: fallbackResults.map((r) => ({ product: r.product, reason: r.reason })),
-        _meta: { layer: 3, method: "fallback" },
+        message: "Here are some of our top-rated foundations to get you started ✨\n\nShare your skin type or finish preference and I'll personalize it for you!",
+        recommendations: fallback.map(r => ({ product: r.product, reason: r.reason })),
+        _meta: { layer: 3, method: 'fallback' },
       },
     });
+
   } catch (error) {
     console.error("❌ Critical error:", error);
     res.status(500).json({ success: false, error: "Failed to get response" });
