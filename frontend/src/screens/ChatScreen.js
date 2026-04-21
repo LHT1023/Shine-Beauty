@@ -41,6 +41,7 @@ export default function ChatScreen() {
     .map((m) => ({
       role: m.role,
       content: m.content,
+      recommendations: m.recommendations?.map((r) => r.product?.name).filter(Boolean) || [],
     }));
 
   const handleSend = async (text = inputText) => {
