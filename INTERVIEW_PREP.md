@@ -266,26 +266,154 @@ if (products.length < 2 && intent.skinType) {
 
 ### Analytics 埋点系统
 
-采用**拦截 `res.json`** 的方式，无侵入接入所有路由：
+#### 技术实现：拦截 `res.json`
 
 ```javascript
-res.json = function(body) {
-  setImmediate(async () => {          // 异步，不阻塞主响应
-    await Analytics.create(event);   // 写入 MongoDB
-  });
-  return originalJson.call(this, body);
+// middleware/analytics.js
+const analyticsMiddleware = (req, res, next) => {
+  const startTime = Date.now();
+  const originalJson = res.json;
+
+  res.json = function(body) {
+    const responseTimeMs = Date.now() - startTime;
+    res.json = originalJson;
+
+    setImmediate(async () => {        // 异步写入，绝不阻塞主响应
+      await Analytics.create(event); // 写入 MongoDB analytics_events collection
+    });
+
+    return originalJson.call(this, body); // 正常返回给用户，埋点在后台进行
+  };
+
+  next();
+};
+```
+
+**PM 视角：** 用 `setImmediate` 异步写入，埋点失败不影响主应用，用户感知不到任何延迟。`server.js` 里一行 `app.use(require('./middleware/analytics'))` 全局接入，所有路由自动被埋点，不需要每个接口单独写。
+
+---
+
+#### 三类埋点事件
+
+**① chat_query（核心）**
+
+```javascript
+{
+  eventType: 'chat_query',
+  query: '油皮哑光粉底液',           // 用户原始输入（截断200字）
+  queryLanguage: 'zh',              // zh / en / mixed
+  aiLayer: 1,                       // 命中哪层：1 / 2 / 3
+  aiMethod: 'keyword_match',        // keyword_match / intent_engine / intent_followup / fallback
+  recommendationCount: 3,           // 返回了几款推荐
+  intentExtracted: { skinType: 'oily', finish: 'matte' },  // Layer 2 提取的 intent
+  responseTimeMs: 41,               // 响应耗时
 }
 ```
 
-记录的事件：
+**② browse_products（浏览行为）**
 
-| 事件类型 | 字段 | 用途 |
-|---|---|---|
-| chat_query | query, queryLanguage, aiLayer, aiMethod, recommendationCount | 推荐效果分析 |
-| browse_products | filters, resultCount | 用户浏览行为 |
-| favorite_add/remove | userId, productId | 推荐接受信号 |
+```javascript
+{
+  eventType: 'browse_products',
+  filters: { finish: 'matte', maxPrice: '50' },  // 用户用了哪些筛选条件
+  resultCount: 12,                                // 筛选后剩几款
+  responseTimeMs: 23,
+}
+```
 
-语言检测：中文字符占比 > 50% → zh，> 10% → mixed，否则 en。
+**③ favorite_add / favorite_remove（接受信号）**
+
+```javascript
+{
+  eventType: 'favorite_add',
+  userId: 'user_abc123',
+  productId: '64f2a1b3c4d5e6f7a8b9c0d1',
+  responseTimeMs: 15,
+}
+```
+
+---
+
+#### 语言检测逻辑
+
+```javascript
+const detectLanguage = (text) => {
+  const chineseChars = (text.match(/[一-鿿]/g) || []).length;
+  const ratio = chineseChars / text.replace(/\s/g, '').length;
+  if (ratio > 0.5) return 'zh';    // 中文为主
+  if (ratio > 0.1) return 'mixed'; // 中英混合
+  return 'en';                      // 英文为主
+};
+```
+
+---
+
+#### 埋点能回答的 PM 问题
+
+| 业务问题 | 用哪个字段回答 |
+|---|---|
+| 多少用户在用中文查询？ | `queryLanguage` 分布 |
+| Layer 1 命中率是多少？ | `aiLayer=1` 占比 |
+| 追问机制触发了多少次？ | `aiMethod=intent_followup` 占比 |
+| 响应时间 P95 是多少？ | `responseTimeMs` 排序 |
+| 用户最常用哪些筛选条件？ | `browse_products.filters` 统计 |
+| 哪些产品被收藏最多？ | `favorite_add.productId` 统计 |
+| 推荐接受率是多少？ | `chat_query` 后的 `favorite_add` 转化 |
+
+---
+
+#### 没有埋但应该埋的（面试主动说）
+
+- **推荐接受率**：chat_query 之后 N 分钟内是否有 favorite_add，这是推荐质量的直接信号
+- **追问完成率**：触发 intent_followup 之后用户是否继续对话还是离开
+- **session 深度**：每个会话的对话轮数，衡量用户参与度
+- **搜索词聚类**：高频 query 是什么，用于扩充关键词词典
+
+**面试话术：**
+> "我现在埋的是系统层指标——推荐了什么、用了哪层、耗时多少。但真正的 PM 指标是用户层的——用户是否接受了推荐。这两层之间的转化才是我最想观测的，也是下一步要补埋的。"
+
+---
+
+#### 用模拟测试数据推算埋点指标（面试可以讲）
+
+没有真实用户，我用 12 个模拟场景的测试数据来推算埋点会看到什么：
+
+**Layer 分布（aiLayer / aiMethod）**
+
+```
+keyword_match    → 6/12 = 50%   （L1命中，响应极快）
+intent_engine    → 2/12 = 17%   （L2有意图有结果）
+intent_followup  → 3/12 = 25%   （L2触发追问）
+fallback         → 1/12 = 8%    （L3兜底）
+```
+
+**queryLanguage 分布**
+
+```
+zh（中文）  → GC-01, GC-05 = 2/12 = 17%
+en（英文）  → 其余 10 个   = 83%
+```
+
+**responseTimeMs 分布**
+
+```
+< 100ms   → 6 个场景（全部 L1）  最快 37ms
+100-2000ms → 4 个场景（L2）
+> 2000ms  → 2 个场景（L2 含 vegan/cruelty-free）  最慢 2634ms
+P95       → 2634ms
+平均       → 954ms
+```
+
+**recommendationCount 分布**
+
+```
+3 款   → 10/12 = 83%（正常推荐）
+1 款   → 1/12 = 8%（GC-04 NARS，硬过滤后只剩1款）
+0 款   → 1/12 = 8%（BC-01 追问，未推荐）
+```
+
+**面试话术：**
+> "我用 12 个模拟场景作为代理数据，推算出系统上线后大约 50% 的请求会在 Layer 1 以 <50ms 返回，25% 会触发追问引导用户补充信息，P95 响应时间约 2.6s。这些数字虽然是模拟的，但让我在没有真实用户的情况下对系统性能有了量化认知，也给了我 SLA 基线——上线后如果 P95 超过 5s 就需要优化。"
 
 ---
 
